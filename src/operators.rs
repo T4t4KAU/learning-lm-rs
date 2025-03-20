@@ -71,25 +71,75 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    // 确保输入维度 >= 2，最后一维为特征维度
+    assert!(y.shape().len() >= 2, "RMSNorm requires at least 2D input");
+    let features = y.shape()[y.shape().len() - 1]; // 特征维度（total_seq_len）
+    let samples = y.size() / features;      // 样本数（batch * seq_len）
+
+    // 确保权重维度匹配
+    assert_eq!(w.shape(), &[features], "Weight shape must match features");
+
+    let x_data = x.data();
+    let mut y_data = unsafe { y.data_mut() };
+    let w_data = w.data();
+
+    // 遍历每个样本（合并 batch 和 seq_len 维度）
+    for i in 0..samples {
+        // 获取当前样本的 x 切片 [features]
+        let x_slice = &x_data[i * features..(i + 1) * features];
+        // 计算平方均值
+        let xi2_mean = x_slice.iter().copied().map(|v| v * v).sum::<f32>() / features as f32;
+        let rms = (xi2_mean + epsilon).sqrt();
+
+        // 对每个特征应用缩放和归一化
+        for j in 0..features {
+            y_data[i * features + j] = w_data[j] * x_slice[j] / rms;
+        }
+    }
 }
 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
+    let len = y.size();
+    assert!(len == x.size());
 
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
+    // data[offset:offset+length]
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
 
-    todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+    for i in 0.._x.len() {
+        _y[i] = _x[i] / (1.0 + std::f32::consts::E.powf(-_x[i])) * _y[i];
+    }
 }
 
 // C = beta * C + alpha * A @ B^T
 // hint: You don't need to do an explicit transpose of B
 pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor<f32>, alpha: f32) {
-    todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+    let n_row = c.shape()[0];
+    let n_col = c.shape()[1];
+    let n_row_a = a.shape()[0];
+    let n_col_a = a.shape()[1];
+    let n_row_b = b.shape()[0];
+    let n_col_b = b.shape()[1];
+
+    let _a = a.data();
+    let mut _c = unsafe { c.data_mut() };
+    let _b = b.data();
+
+    for i in 0..n_row {
+        for j in 0..n_col {
+            let a_i = &a.data()[i * n_col_a..][..n_col_a];
+            let b_j = &b.data()[j * n_col_b..][..n_col_b];
+            let mut sum: f32 = 0.0;
+
+            for k in 0..a_i.len() {
+                sum += a_i[k] * b_j[k];
+            }
+
+            _c[i * n_col + j] = alpha * sum + beta * _c[i * n_col + j];
+        }
+    }
 }
 
 // Dot product of two tensors (treated as vectors)
