@@ -169,35 +169,55 @@ impl Llama<f32> {
     ) -> Vec<u32> {
         let mut result = Vec::<u32>::from(token_ids);
         result.push(self.bos_token_id);
+        let mut cache: KVCache<f32> =
+            KVCache::new(self.n_layers, self.max_seq_len, self.n_kv_h * self.dqkv, 0);
+        let mut input = Tensor::<u32>::new(token_ids.to_vec(), &vec![token_ids.len()]);
 
-        let mut input = result.clone();
-        let mut cache = KVCache::new(self.n_layers, self.max_seq_len, self.n_kv_h*self.dqkv, 0);
+        // 按照最大长度生成结果
+        for _ in 0..max_len {
+            // 前向传播，获取 logits
+            let logits = self.forward(&input, &mut cache);
 
-        while result.len() < max_len {
-            let mut logits = self.forward(&Tensor::<u32>::new(input.clone(), &vec![input.len()]), &mut cache);
-            let logits_length = logits.size();
-            let logits_data = unsafe { logits.data_mut() };
-            if temperature > 0. {
-                for i in 0..logits_length {
-                    logits_data[i] /= temperature;
-                }
+            let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+
+            if next_token == self.eos_token_id {
+                break;
             }
+            result.push(next_token);
 
-            masked_softmax(&mut logits);
+            input = Tensor::<u32>::new(vec![next_token], &vec![1]);
+        }
 
-            let new_word_id = OP::random_sample(&logits, top_p, top_k, temperature);
+        result
+    }
 
-            if new_word_id == self.eos_token_id {
+    // 回答问题 添加cache
+    pub fn answer(
+        &self,
+        token_ids: &[u32],
+        max_len: usize,
+        top_p: f32,
+        top_k: u32,
+        temperature: f32,
+        kv_cache: &mut KVCache<f32>,
+    ) -> Vec<u32> {
+        let mut result = Vec::<u32>::from(token_ids);
+        result.push(self.bos_token_id);
+        let mut input = Tensor::<u32>::new(token_ids.to_vec(), &vec![token_ids.len()]);
+
+        // 按照最大长度生成结果
+        for _ in 0..max_len {
+            // 前向传播，获取 logits
+            let logits = self.forward(&input, kv_cache);
+
+            let next_token = OP::random_sample(&logits, top_p, top_k, temperature);
+
+            if next_token == self.eos_token_id {
                 break;
             }
 
-            result.push(new_word_id);
-            input = vec![new_word_id];
-
-
-            if result.len() < max_len {
-                println!("max len");
-            }
+            result.push(next_token);
+            input = Tensor::<u32>::new(vec![next_token], &vec![1]);
         }
 
         result
@@ -216,39 +236,40 @@ fn self_attention(
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    // 1. 计算注意力分数
+    // 计算注意力分数
     for kv_head in 0..n_kv_h {
         for group in 0..n_groups {
-
             let mut attn_data = unsafe { att_scores.data_mut() };
-
             let q_head = kv_head * n_groups + group; // 当前 Q 头索引
             let q_stride = n_kv_h * n_groups * dqkv; // Q 每个 seq 位置的总维度
-            let k_stride = n_kv_h * dqkv;            // K 每个 seq 位置的总维度
+            let k_stride = n_kv_h * dqkv; // K 每个 seq 位置的总维度
 
+            // 点积
             for q_pos in 0..seq_len {
                 for k_pos in 0..total_seq_len {
-                    // 正确索引：Q[q_pos, q_head * dqkv + d] 和 K[k_pos, kv_head * dqkv + d]
-                    let score = (0..dqkv).map(|d| {
-                        q.data()[q_pos * q_stride + q_head * dqkv + d] *
-                            k.data()[k_pos * k_stride + kv_head * dqkv + d]
-                    }).sum::<f32>() * (1.0 / (dqkv as f32).sqrt());
+                    // Q[q_pos, q_head * dqkv + d] & K[k_pos, kv_head * dqkv + d]
+                    let score = (0..dqkv)
+                        .map(|d| {
+                            q.data()[q_pos * q_stride + q_head * dqkv + d]
+                                * k.data()[k_pos * k_stride + kv_head * dqkv + d]
+                        })
+                        .sum::<f32>()
+                        * (1.0 / (dqkv as f32).sqrt());
 
                     // 存入 att_scores：[kv_head][group][q_pos][k_pos]
-                    let attn_idx = kv_head * n_groups * seq_len * total_seq_len +
-                        group * seq_len * total_seq_len +
-                        q_pos * total_seq_len +
-                        k_pos;
+                    let attn_idx = kv_head * n_groups * seq_len * total_seq_len
+                        + group * seq_len * total_seq_len
+                        + q_pos * total_seq_len
+                        + k_pos;
                     attn_data[attn_idx] = score;
                 }
             }
         }
     }
 
-    // 2. 应用 Softmax
     masked_softmax(att_scores);
 
-    // 3. 加权求和（Attn @ V）
+    // 加权求和（Attn @ V）
     for kv_head in 0..n_kv_h {
         for group in 0..n_groups {
             let q_head = kv_head * n_groups + group;
@@ -257,17 +278,20 @@ fn self_attention(
             let mut hidden_data = unsafe { hidden_states.data_mut() };
 
             for q_pos in 0..seq_len {
-                for d in 0..dqkv { // 维度索引，非 K 位置
+                for d in 0..dqkv {
+                    // 维度索引，非 K 位置
                     // 注意力权重：att_scores[kv_head][group][q_pos][k_pos]
                     // V 的值：V[k_pos][kv_head * dqkv + d]
-                    let value = (0..total_seq_len).map(|k_pos| {
-                        let attn_idx = kv_head * n_groups * seq_len * total_seq_len +
-                            group * seq_len * total_seq_len +
-                            q_pos * total_seq_len +
-                            k_pos;
-                        att_scores.data()[attn_idx] *
-                            v.data()[k_pos * v_stride + kv_head * dqkv + d]
-                    }).sum::<f32>();
+                    let value = (0..total_seq_len)
+                        .map(|k_pos| {
+                            let attn_idx = kv_head * n_groups * seq_len * total_seq_len
+                                + group * seq_len * total_seq_len
+                                + q_pos * total_seq_len
+                                + k_pos;
+                            att_scores.data()[attn_idx]
+                                * v.data()[k_pos * v_stride + kv_head * dqkv + d]
+                        })
+                        .sum::<f32>();
 
                     // 存入 hidden_states：[q_pos][q_head * dqkv + d]
                     let h_idx = q_pos * h_stride + q_head * dqkv + d;

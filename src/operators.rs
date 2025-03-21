@@ -74,7 +74,7 @@ pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: 
     // 确保输入维度 >= 2，最后一维为特征维度
     assert!(y.shape().len() >= 2, "RMSNorm requires at least 2D input");
     let features = y.shape()[y.shape().len() - 1]; // 特征维度（total_seq_len）
-    let samples = y.size() / features;      // 样本数（batch * seq_len）
+    let samples = y.size() / features; // 样本数（batch * seq_len）
 
     // 确保权重维度匹配
     assert_eq!(w.shape(), &[features], "Weight shape must match features");
